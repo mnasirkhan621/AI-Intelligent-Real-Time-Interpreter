@@ -1,0 +1,8 @@
+groq
+deepgram-sdk
+sounddevice
+python-dotenv
+customtkinter
+numpy
+soundfile
+edge-tts
