@@ -1,9 +1,10 @@
 groq
-deepgram-sdk
-sounddevice
 python-dotenv
-customtkinter
+sounddevice
 numpy
 soundfile
-edge-tts
+deepgram-sdk
 elevenlabs
+customtkinter
+webrtcvad-wheels
+pyinstaller

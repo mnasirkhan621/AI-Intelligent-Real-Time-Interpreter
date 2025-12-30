@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class TranslationEngine:
-    def __init__(self, api_keys, input_device, output_device, source_lang, target_lang, verbose_callback=None, engine_name="Engine"):
+    def __init__(self, api_keys, input_device, output_device, source_lang, target_lang, verbose_callback=None, volume_callback=None, shared_event=None, engine_name="Engine"):
         self.groq_client = AsyncGroq(api_key=api_keys.get("GROQ_API_KEY"))
         # self.deepgram_client = AsyncDeepgramClient(api_key=api_keys.get("DEEPGRAM_API_KEY")) # Kept for reference or removal
         self.elevenlabs_client = AsyncElevenLabs(api_key=api_keys.get("ELEVENLABS_API_KEY"))
@@ -24,19 +24,22 @@ class TranslationEngine:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.verbose_callback = verbose_callback
+        self.volume_callback = volume_callback # Visualizer Callback
+        self.shared_event = shared_event # GLOBAL INTERLOCK
         self.engine_name = engine_name
 
         self.is_running = False
         self.audio_queue = asyncio.Queue()
         self.output_queue = asyncio.Queue()
         self.stop_event = asyncio.Event()
+        self.is_playing_audio = False  # Flag for Half-Duplex (Self-Deafening)
         
         # Audio Settings
         self.samplerate = 16000
         self.channels = 1
-        self.chunk_duration = 5.0 # Increased to 5s for better Scribe context
+        self.chunk_duration = 5.0 
         self.chunk_samples = int(self.samplerate * self.chunk_duration)
-        self.silence_threshold = 0.01 # Lowered back to 0.01 (rms) to catch mic input
+        self.silence_threshold = 0.01 
         
         # ISO-639-1 Mapping for ElevenLabs Scribe
         self.lang_map = {
@@ -70,97 +73,207 @@ class TranslationEngine:
         logger.info(message)
 
     async def _audio_producer(self):
-        """Continuously captures audio and pushes to queue."""
-        def callback(indata, frames, time, status):
-            if status:
-                logger.warning(status)
-            if self.is_running:
-                self.loop.call_soon_threadsafe(self.audio_queue.put_nowait, indata.copy())
-
-        stream = sd.InputStream(
-            device=self.input_device,
-            channels=self.channels,
-            samplerate=self.samplerate,
-            callback=callback,
-            blocksize=self.chunk_samples
-        )
+        """Step A: Capture Audio with VAD (Voice Activity Detection)."""
+        loop = asyncio.get_event_loop()
+        import webrtcvad
         
-        with stream:
-            self._log("Audio Capture Started")
-            while self.is_running:
-                await asyncio.sleep(0.1)
+        vad = webrtcvad.Vad(3) # Mode 3: Very Aggressive (Filters background noise)
+        frame_duration_ms = 30
+        frame_samples = int(self.samplerate * frame_duration_ms / 1000) # 480 samples
+        
+        # VAD State
+        triggered = False
+        buffer = []
+        silence_counter = 0
+        SUCCESSIVE_SILENCE_LIMIT = int(1000 / frame_duration_ms) # 1 sec of silence to stop
+        
+        def callback(indata, frames, time_info, status):
+            nonlocal triggered, silence_counter, buffer
+            if status:
+                pass
+            
+            # VISUALIZER UPDATE
+            if self.volume_callback:
+                rms = np.sqrt(np.mean(indata**2))
+                # Normalize reasonably (mic input is usually low)
+                level = min(rms * 5, 1.0) 
+                loop.call_soon_threadsafe(self.volume_callback, level)
+
+            # GLOBAL INTERLOCK: If ANY engine is speaking (shared_event set), DON'T LISTEN.
+            if self.shared_event and self.shared_event.is_set():
+                triggered = False
+                buffer = []
+                silence_counter = 0
+                return
+            
+            # SELF-DEAFENING: (Fallback)
+            if self.is_playing_audio:
+                triggered = False
+                buffer = []
+                silence_counter = 0
+                return
+
+            if self.is_running:
+                # Convert float32 -> int16 bytes for WebRTCVAD
+                audio_int16 = (indata * 32767).astype(np.int16)
+                audio_bytes = audio_int16.tobytes()
+                
+                try:
+                    is_speech = vad.is_speech(audio_bytes, self.samplerate)
+                except:
+                    is_speech = False
+                
+                if is_speech:
+                    if not triggered:
+                        triggered = True
+                        if self.verbose_callback:
+                            loop.call_soon_threadsafe(self.verbose_callback, f"[{self.engine_name}] Speech Detected...")
+                    silence_counter = 0
+                    buffer.append(indata.copy())
+                else:
+                    if triggered:
+                        silence_counter += 1
+                        buffer.append(indata.copy()) # Keep padding
+                        
+                        if silence_counter > SUCCESSIVE_SILENCE_LIMIT:
+                            triggered = False
+                            # Flush buffer
+                            if buffer:
+                                full_audio = np.concatenate(buffer)
+                                loop.call_soon_threadsafe(self.audio_queue.put_nowait, full_audio)
+                            buffer = []
+                            silence_counter = 0
+                            if self.verbose_callback:
+                                loop.call_soon_threadsafe(self.verbose_callback, f"[{self.engine_name}] End of Speech. Processing...")
+
+        try:
+            logger.info(f"Audio Capture Started on Device: {self.input_device}")
+            stream = sd.InputStream(
+                device=self.input_device,
+                channels=self.channels,
+                samplerate=self.samplerate,
+                callback=callback,
+                blocksize=frame_samples # 30ms frames
+            )
+            with stream:
+                while self.is_running:
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Audio Capture Failed: {e}")
+            self.stop_event.set()
 
     async def _processing_consumer(self):
-        """Consumes audio chunks, processes them, and pushes result to output queue."""
+        """Step B: Process Audio (STT -> LLM -> TTS)."""
         while self.is_running:
             try:
+                # Wait for VAD-segmented audio chunk
+                if self.audio_queue.empty():
+                    await asyncio.sleep(0.05)
+                    continue
+                
                 audio_data = await self.audio_queue.get()
                 
-                # RMS-based Silence Detection
-                rms = np.sqrt(np.mean(audio_data**2))
-                if rms < self.silence_threshold:
-                    continue
-
-                start_time = time.time()
-                
-                text = await self._transcribe(audio_data)
-                
-                # Robust Filtering for Noise/Hallucinations
-                ignored_phrases = [
-                    ".", "...", "?", "!", "you", "thank you", "subtitles", 
-                    "watching", "video", "subscribe", "notification", "copyright"
-                ]
-                
-                clean_text = text.strip().lower() if text else ""
-                if (not text 
-                    or len(clean_text) < 3 
-                    or clean_text in ignored_phrases
-                    or clean_text.startswith("(")  # (Music), (Applause)
-                ):
-                    continue
-                
-                t_transcribe = time.time()
-                
-                translated_text = await self._translate(text)
-                if not translated_text:
-                    continue
-                t_translate = time.time()
-
-                audio_bytes = await self._text_to_speech(translated_text)
-                if not audio_bytes:
-                    continue
-                t_tts = time.time()
-
-                # Push to Output Queue instead of playing directly
-                await self.output_queue.put(audio_bytes)
-                
-                t_end = time.time()
-                
-                # Calculate individual component times
-                stt_time = (t_transcribe - start_time) * 1000
-                llm_time = (t_translate - t_transcribe) * 1000
-                tts_time = (t_tts - t_translate) * 1000
-                total_time = (t_end - start_time) * 1000
-
-                # Log messages with engine name prefix
-                if self.verbose_callback:
-                    self.verbose_callback(f"Original: {text} -> Translated: {translated_text}")
-                logger.info(f"[{self.engine_name}] Original: {text} -> Translated: {translated_text}")
-                logger.info(f"[{self.engine_name}] Pipeline: {int(total_time)}ms | STT: {int(stt_time)}ms | LLM: {int(llm_time)}ms | TTS: {int(tts_time)}ms")
+                # --- PROCESS AUDIO ---
+                try:
+                    start_time = time.time()
+                    
+                    text = await self._transcribe(audio_data)
+                    
+                    # Robust Filtering
+                    ignored_phrases = [
+                        ".", "...", "?", "!", "you", "thank you", "subtitles", 
+                        "watching", "video", "subscribe", "notification", "copyright"
+                    ]
+                    
+                    clean_text = text.strip().lower() if text else ""
+                    if (not text 
+                        or len(clean_text) < 2 
+                        or clean_text in ignored_phrases
+                        or clean_text.startswith("(") 
+                    ):
+                        continue
+                    
+                    t_transcribe = time.time()
+                    
+                    translated_text = await self._translate(text)
+                    if not translated_text:
+                        continue
+                    t_translate = time.time()
+                    
+                    # Log messages (Show user it's starting)
+                    if self.verbose_callback:
+                        self.verbose_callback(f"Original: {text} -> Translated: {translated_text}")
+                    logger.info(f"[{self.engine_name}] Original: {text} -> Translated: {translated_text}")
+                    
+                     # --- STREAMING TTS PIPELINE ---
+                    tts_start = time.time()
+                    first_chunk = True
+                    
+                    async for chunk in self._text_to_speech(translated_text):
+                        await self.output_queue.put(chunk)
+                        if first_chunk:
+                             first_chunk = False
+                             tts_latency = (time.time() - t_translate) * 1000
+                             logger.info(f"[{self.engine_name}] TTS First Byte: {int(tts_latency)}ms")
+    
+                    total_time = (time.time() - start_time) * 1000
+                    logger.info(f"[{self.engine_name}] Pipeline Total: {int(total_time)}ms")
+                    
+                except Exception as inner_e:
+                    logger.error(f"Processing Error (Auto-Recovering): {inner_e}")
+                    self._log(f"⚠️ Connection Glitch: {inner_e}. Retrying...")
+                    await asyncio.sleep(2) # Backoff
                 
             except Exception as e:
-                logger.error(f"Error in processing pipeline: {e}")
-                self._log(f"Error: {e}")
+                logger.error(f"Critical Pipeline Error: {e}")
+                await asyncio.sleep(5)
 
     async def _playback_consumer(self):
-        """Consumes generated audio chunks and plays them sequentially."""
-        while self.is_running:
-            try:
-                audio_bytes = await self.output_queue.get()
-                # Run playback in a thread to avoid blocking the event loop
-                await asyncio.to_thread(self._play_audio, audio_bytes)
-            except Exception as e:
-                logger.error(f"Error in playback: {e}")
+        """Consumes PCM audio chunks and plays them via RawOutputStream."""
+        import sounddevice as sd
+        
+        # Open a Persistent Stream for Low Latency
+        try:
+            stream = sd.RawOutputStream(
+                samplerate=16000, 
+                channels=1, 
+                dtype='int16', 
+                device=self.output_device,
+                blocksize=1024
+            )
+            
+            with stream:
+                while self.is_running:
+                    if self.output_queue.empty():
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    # Mute Microphone (Half-Duplex)
+                    self.is_playing_audio = True
+                    if self.shared_event:
+                        self.shared_event.set() # SIGNAL GLOBAL MUTE
+                    
+                    try:
+                        while not self.output_queue.empty():
+                            chunk_bytes = await self.output_queue.get()
+                            if chunk_bytes:
+                                # Convert raw bytes to numpy Int16 array for sounddevice
+                                chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16)
+                                stream.write(chunk_np)
+                        
+                        # Small buffer drain time
+                        await asyncio.sleep(0.1)
+                        
+                    finally:
+                        self.is_playing_audio = False
+                        if self.shared_event:
+                            self.shared_event.clear() # UNMUTE
+                    
+        except Exception as e:
+            logger.error(f"Playback Stream Error: {e}")
+            self.is_playing_audio = False
+            if self.shared_event:
+                self.shared_event.clear()
 
     async def _transcribe(self, audio_data):
         """Step B: Transcribe audio using Groq Whisper."""
@@ -214,53 +327,20 @@ class TranslationEngine:
             return text 
 
     async def _text_to_speech(self, text):
-        """Step D: Generate Audio using ElevenLabs (Production Quality)."""
+        """Step D: AES (Audio Stream Generation) - PCM 16kHz."""
         try:
-            # Voice ID: "Rachel" (21m00Tcm4TlvDq8ikWAM) - generic pleasant voice
-            # Model: "eleven_turbo_v2_5" - Fastest, Multilingual, Low Latency
-            
-            # Using streaming to reduce TTFB (Time To First Byte)
-            # stream() returns an async generator, so we iterate over it directly. Do not await the call itself.
-            audio_stream = self.elevenlabs_client.text_to_speech.stream(
+            # Use 'pcm_16000' for raw playback without decoding overhead
+            audio_stream = self.elevenlabs_client.text_to_speech.convert(
                 text=text,
                 voice_id="21m00Tcm4TlvDq8ikWAM",
                 model_id="eleven_turbo_v2_5",
-                output_format="mp3_44100_128"
+                output_format="pcm_16000"
             )
-            
-            import io
-            audio_buffer = io.BytesIO()
-            
-            # Use async generator if stream=True (default in async client typically returns generator? check SDK)
-            # Recent ElevenLabs SDK: client.convert returns generator (or async generator for async client)
             
             async for chunk in audio_stream:
                 if chunk:
-                    audio_buffer.write(chunk)
-            
-            audio_buffer.seek(0)
-            return audio_buffer.read()
+                    yield chunk
+
         except Exception as e:
-            logger.error(f"TTS failed: {e}")
-            return None
-
-    def _play_audio(self, audio_data):
-        """Step E: Stream audio to Virtual Cable."""
-        try:
-            import soundfile as sf
-            import io
-            
-            with io.BytesIO(audio_data) as f:
-                data, fs = sf.read(f)
-                data = data.astype(np.float32)
-                
-                if self.output_device is not None:
-                     # blocking=True is fine here because we are in a separate Thread (via to_thread)
-                     sd.play(data, samplerate=fs, device=self.output_device, blocking=True)
-                else:
-                    logger.warning("No output device selected.")
-        except Exception as e:
-            logger.error(f"Playback failed: {e}")
-
-
-
+            logger.error(f"TTS Stream failed: {e}")
+            yield None

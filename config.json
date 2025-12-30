@@ -1,0 +1,9 @@
+{
+    "GROQ_API_KEY": "",
+    "ELEVENLABS_API_KEY": "",
+    "DEEPGRAM_API_KEY": "",
+    "INPUT_DEVICE": 1,
+    "OUTPUT_DEVICE": 4,
+    "SOURCE_LANG": "English",
+    "TARGET_LANG": "Urdu"
+}
