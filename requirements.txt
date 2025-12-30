@@ -6,3 +6,4 @@ customtkinter
 numpy
 soundfile
 edge-tts
+elevenlabs

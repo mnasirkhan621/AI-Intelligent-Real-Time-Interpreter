@@ -7,32 +7,44 @@ import logging
 from collections import deque
 from groq import AsyncGroq
 from deepgram import AsyncDeepgramClient
+from elevenlabs.client import AsyncElevenLabs
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class TranslationEngine:
-    def __init__(self, api_keys, input_device, output_device, source_lang, target_lang, verbose_callback=None):
+    def __init__(self, api_keys, input_device, output_device, source_lang, target_lang, verbose_callback=None, engine_name="Engine"):
         self.groq_client = AsyncGroq(api_key=api_keys.get("GROQ_API_KEY"))
-        self.deepgram_client = AsyncDeepgramClient(api_key=api_keys.get("DEEPGRAM_API_KEY"))
+        # self.deepgram_client = AsyncDeepgramClient(api_key=api_keys.get("DEEPGRAM_API_KEY")) # Kept for reference or removal
+        self.elevenlabs_client = AsyncElevenLabs(api_key=api_keys.get("ELEVENLABS_API_KEY"))
         
         self.input_device = input_device
         self.output_device = output_device
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.verbose_callback = verbose_callback
+        self.engine_name = engine_name
 
         self.is_running = False
         self.audio_queue = asyncio.Queue()
         self.output_queue = asyncio.Queue()
+        self.stop_event = asyncio.Event()
         
         # Audio Settings
         self.samplerate = 16000
         self.channels = 1
-        self.chunk_duration = 3.0 # Seconds
+        self.chunk_duration = 5.0 # Increased to 5s for better Scribe context
         self.chunk_samples = int(self.samplerate * self.chunk_duration)
-        self.silence_threshold = 0.01 # Adjustable threshold
+        self.silence_threshold = 0.01 # Lowered back to 0.01 (rms) to catch mic input
+        
+        # ISO-639-1 Mapping for ElevenLabs Scribe
+        self.lang_map = {
+            "English": "en", "Urdu": "ur", "Hindi": "hi", "Spanish": "es", 
+            "Japanese": "ja", "French": "fr", "German": "de", "Chinese": "zh",
+            "Arabic": "ar", "Russian": "ru", "Portuguese": "pt", "Italian": "it",
+            "Korean": "ko", "Turkish": "tr", "Dutch": "nl"
+        }
 
     async def start(self):
         """Starts the translation engine pipeline."""
@@ -84,18 +96,29 @@ class TranslationEngine:
             try:
                 audio_data = await self.audio_queue.get()
                 
-                volume_norm = np.linalg.norm(audio_data) * 10
-                if volume_norm < self.silence_threshold:
+                # RMS-based Silence Detection
+                rms = np.sqrt(np.mean(audio_data**2))
+                if rms < self.silence_threshold:
                     continue
 
                 start_time = time.time()
                 
                 text = await self._transcribe(audio_data)
                 
-                # Filter out empty or noise (e.g., "...", ".")
-                if not text or len(text.strip()) < 2 or text.strip() in [".", "...", "?", "!"]:
+                # Robust Filtering for Noise/Hallucinations
+                ignored_phrases = [
+                    ".", "...", "?", "!", "you", "thank you", "subtitles", 
+                    "watching", "video", "subscribe", "notification", "copyright"
+                ]
+                
+                clean_text = text.strip().lower() if text else ""
+                if (not text 
+                    or len(clean_text) < 3 
+                    or clean_text in ignored_phrases
+                    or clean_text.startswith("(")  # (Music), (Applause)
+                ):
                     continue
-
+                
                 t_transcribe = time.time()
                 
                 translated_text = await self._translate(text)
@@ -112,13 +135,18 @@ class TranslationEngine:
                 await self.output_queue.put(audio_bytes)
                 
                 t_end = time.time()
-                latency_ms = (t_end - start_time) * 1000
-                stats = (f"Pipeline: {latency_ms:.0f}ms | "
-                         f"STT: {(t_transcribe - start_time)*1000:.0f}ms | "
-                         f"LLM: {(t_translate - t_transcribe)*1000:.0f}ms | "
-                         f"TTS: {(t_tts - t_translate)*1000:.0f}ms")
-                self._log(f"Original: {text} -> Translated: {translated_text}")
-                self._log(stats)
+                
+                # Calculate individual component times
+                stt_time = (t_transcribe - start_time) * 1000
+                llm_time = (t_translate - t_transcribe) * 1000
+                tts_time = (t_tts - t_translate) * 1000
+                total_time = (t_end - start_time) * 1000
+
+                # Log messages with engine name prefix
+                if self.verbose_callback:
+                    self.verbose_callback(f"Original: {text} -> Translated: {translated_text}")
+                logger.info(f"[{self.engine_name}] Original: {text} -> Translated: {translated_text}")
+                logger.info(f"[{self.engine_name}] Pipeline: {int(total_time)}ms | STT: {int(stt_time)}ms | LLM: {int(llm_time)}ms | TTS: {int(tts_time)}ms")
                 
             except Exception as e:
                 logger.error(f"Error in processing pipeline: {e}")
@@ -145,18 +173,21 @@ class TranslationEngine:
             buffer.name = 'audio.wav' 
             buffer.seek(0)
             
-            # Determine model based on language
-            # 'distil-whisper-large-v3-en' is decommissioned. Using 'whisper-large-v3' for all.
-            model_id = "whisper-large-v3"
+            # Resolve language code
+            lang_code = self.lang_map.get(self.source_lang, "en")
             
-            transcription = await self.groq_client.audio.transcriptions.create(
-                file=(buffer.name, buffer.read()),
-                model=model_id,
-                prompt=f"The audio is in {self.source_lang}", 
-                response_format="json",
-                language=None 
+            # Use ElevenLabs Scribe (Speech to Text)
+            # Model: scribe_v1
+            # Optimization: Tag Audio Events False to remove (traffic noises)
+            transcript = await self.elevenlabs_client.speech_to_text.convert(
+                file=buffer,
+                model_id="scribe_v1",
+                language_code=lang_code,
+                tag_audio_events=False
             )
-            return transcription.text.strip()
+            
+            # Ensure we extract text properly (transcript is likely an object)
+            return transcript.text.strip()
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
             return None
@@ -183,36 +214,30 @@ class TranslationEngine:
             return text 
 
     async def _text_to_speech(self, text):
-        """Step D: Generate Audio using Edge TTS (Multilingual & Fast)."""
+        """Step D: Generate Audio using ElevenLabs (Production Quality)."""
         try:
-            import edge_tts
+            # Voice ID: "Rachel" (21m00Tcm4TlvDq8ikWAM) - generic pleasant voice
+            # Model: "eleven_turbo_v2_5" - Fastest, Multilingual, Low Latency
             
-            # Select Voice based on Target Language
-            # Full list: https://gist.github.com/jisuk/7e5f03761F34101F4106
-            lang = self.target_lang.lower()
-            voice = "en-US-AriaNeural" # Default
-            
-            if "urdu" in lang:
-                voice = "ur-PK-UzmaNeural"
-            elif "hindi" in lang:
-                voice = "hi-IN-SwaraNeural"
-            elif "spanish" in lang:
-                voice = "es-ES-ElviraNeural"
-            elif "french" in lang:
-                voice = "fr-FR-DeniseNeural"
-            elif "japanese" in lang:
-                voice = "ja-JP-NanamiNeural"
-            # Add more mappings as needed
-            
-            communicate = edge_tts.Communicate(text, voice)
+            # Using streaming to reduce TTFB (Time To First Byte)
+            # stream() returns an async generator, so we iterate over it directly. Do not await the call itself.
+            audio_stream = self.elevenlabs_client.text_to_speech.stream(
+                text=text,
+                voice_id="21m00Tcm4TlvDq8ikWAM",
+                model_id="eleven_turbo_v2_5",
+                output_format="mp3_44100_128"
+            )
             
             import io
             audio_buffer = io.BytesIO()
             
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_buffer.write(chunk["data"])
-                
+            # Use async generator if stream=True (default in async client typically returns generator? check SDK)
+            # Recent ElevenLabs SDK: client.convert returns generator (or async generator for async client)
+            
+            async for chunk in audio_stream:
+                if chunk:
+                    audio_buffer.write(chunk)
+            
             audio_buffer.seek(0)
             return audio_buffer.read()
         except Exception as e:
@@ -236,4 +261,6 @@ class TranslationEngine:
                     logger.warning("No output device selected.")
         except Exception as e:
             logger.error(f"Playback failed: {e}")
+
+
 
